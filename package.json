@@ -1,0 +1,13 @@
+{
+  "name": "amazon-prime-label-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Internal tool to sync Amazon Prime orders, buy ZPL labels, and inject SKU/Qty footer.",
+  "scripts": {
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev": "npm run dev:backend && npm run dev:frontend",
+    "start": "cd backend && npm start"
+  }
+}
+
