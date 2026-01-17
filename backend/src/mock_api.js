@@ -179,27 +179,24 @@ export async function mockBuyLabel({ amazon_order_id, weight, dimensions }) {
 
   // Return structure matching Amazon MFN API createShipment response
   return {
-    Shipment: {
-      ShipmentId: `MOCK-SHIPMENT-${amazon_order_id}`,
-      TrackingId: `MOCK-TRACKING-${amazon_order_id}`,
-      Label: {
-        Dimensions: {
-          Length: 4,
-          Width: 6,
-          Unit: 'inches'
-        },
-        FileContents: {
-          Contents: gzipped.toString('base64'),
-          FileType: 'application/zpl',
-          Checksum: 'mock-checksum'
-        },
-        LabelFormat: 'ZPL203'
+    payload: {
+      Shipment: {
+        ShipmentId: `MOCK-SHIPMENT-${amazon_order_id}`,
+        TrackingId: `MOCK-TRACKING-${amazon_order_id}`,
+        Label: {
+          Dimensions: {
+            Length: 4,
+            Width: 6,
+            Unit: 'inches'
+          },
+          FileContents: {
+            Contents: gzipped.toString('base64'),
+            FileType: 'application/zpl',
+            Checksum: 'mock-checksum'
+          },
+          LabelFormat: 'ZPL203'
+        }
       }
-    },
-    // Add these fields for backwards compatibility with existing code
-    labelGzipped: gzipped.toString('base64'),
-    sku: firstItem.SellerSKU,
-    quantity: firstItem.QuantityOrdered,
-    trackingId: `MOCK-TRACKING-${amazon_order_id}`
+    }
   };
 }

@@ -10,14 +10,14 @@ export const DATABASE_URL = process.env.DATABASE_URL;
 export const USE_MOCK = String(process.env.USE_MOCK).toLowerCase() === 'true';
 
 export const SHIP_FROM_ADDRESS = {
-  name: process.env.SHIP_FROM_NAME || 'Your Warehouse Name',
-  addressLine1: process.env.SHIP_FROM_ADDRESS_LINE1 || '123 Example Street',
-  addressLine2: process.env.SHIP_FROM_ADDRESS_LINE2 || '',
-  city: process.env.SHIP_FROM_CITY || 'City',
-  stateOrRegion: process.env.SHIP_FROM_STATE || 'RM',
-  postalCode: process.env.SHIP_FROM_POSTAL_CODE || '00100',
-  countryCode: process.env.SHIP_FROM_COUNTRY || 'IT',
-  phone: process.env.SHIP_FROM_PHONE || '0000000000'
+  Name: process.env.SHIP_FROM_NAME || 'Your Warehouse Name',
+  AddressLine1: process.env.SHIP_FROM_ADDRESS_LINE1 || '123 Example Street',
+  AddressLine2: process.env.SHIP_FROM_ADDRESS_LINE2 || '',
+  City: process.env.SHIP_FROM_CITY || 'City',
+  StateOrProvinceCode: process.env.SHIP_FROM_STATE || 'RM',
+  PostalCode: process.env.SHIP_FROM_POSTAL_CODE || '00100',
+  CountryCode: process.env.SHIP_FROM_COUNTRY || 'IT',
+  PhoneNumber: process.env.SHIP_FROM_PHONE || '0000000000'
 };
 
 export const AMAZON_CONFIG = {

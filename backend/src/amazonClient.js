@@ -294,8 +294,8 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
     { context: `createShipment ${amazon_order_id}` }
   );
 
-  // Extract shipment from payload wrapper
-  const shipment = shipmentResponse?.payload?.Shipment || shipmentResponse?.Shipment;
+  // Extract shipment from payload wrapper (both mock and real API use this structure)
+  const shipment = shipmentResponse.payload.Shipment;
   
   if (!shipment) {
     throw new Error('Shipment data missing in createShipment response.');
@@ -307,9 +307,7 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
   }
 
   // Amazon returns the label in FileContents.Contents (base64-encoded gzipped ZPL)
-  // Note: Some APIs use "Data" and others use "Contents" - handle both
-  const base64Gzipped = labelDetails.FileContents.Contents || 
-                        labelDetails.FileContents.Data;
+  const base64Gzipped = labelDetails.FileContents.Contents;
   
   if (!base64Gzipped) {
     throw new Error('Label file contents missing in createShipment response.');
