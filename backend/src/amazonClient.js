@@ -3,8 +3,86 @@ import SellingPartnerAPI from 'amazon-sp-api';
 import { AMAZON_CONFIG, SHIP_FROM_ADDRESS, USE_MOCK } from './config.js';
 import { mockFetchUnshippedPrimeOrdersWithItems, mockBuyLabel } from './mock_api.js';
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const RETRYABLE_ERROR_CODES = new Set([
+  'QuotaExceeded',
+  'ETIMEDOUT',
+  'ESOCKETTIMEDOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'ECONNABORTED',
+  'ENETUNREACH'
+]);
+
+function getErrorStatus(error) {
+  return error?.statusCode ?? error?.response?.status ?? error?.status ?? null;
+}
+
+function hasQuotaExceeded(error) {
+  if (error?.code === 'QuotaExceeded') {
+    return true;
+  }
+
+  const errorCode = error?.errors?.[0]?.code;
+  if (errorCode === 'QuotaExceeded') {
+    return true;
+  }
+
+  return typeof error?.message === 'string' && error.message.includes('QuotaExceeded');
+}
+
+function isNetworkTimeout(error) {
+  if (error?.code && RETRYABLE_ERROR_CODES.has(error.code)) {
+    return true;
+  }
+
+  return typeof error?.message === 'string' && error.message.toLowerCase().includes('timeout');
+}
+
+function isRetryableError(error) {
+  const status = getErrorStatus(error);
+
+  if (status === 503) {
+    return true;
+  }
+
+  if (status && status >= 400) {
+    return false;
+  }
+
+  return hasQuotaExceeded(error) || isNetworkTimeout(error);
+}
+
+async function retryWithBackoff(fn, { context, maxRetries = 3, baseDelayMs = 1000 } = {}) {
+  let attempt = 0;
+  let lastError;
+
+  while (attempt <= maxRetries) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+
+      if (!isRetryableError(error) || attempt === maxRetries) {
+        throw error;
+      }
+
+      const retryNumber = attempt + 1;
+      const delayMs = baseDelayMs * Math.pow(2, attempt);
+      const contextLabel = context ? ` for ${context}` : '';
+
+      console.warn(
+        `Retrying Amazon SP-API call${contextLabel} (retry ${retryNumber}/${maxRetries})`,
+        error
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      attempt += 1;
+    }
+  }
+
+  throw lastError;
 }
 
 async function createSpClient() {
@@ -39,15 +117,19 @@ export async function fetchUnshippedPrimeOrdersWithItems() {
   const sp = await createSpClient();
 
   // Step A: GET /orders/v0/orders
-  const ordersResponse = await sp.callAPI({
-    operation: 'getOrders',
-    endpoint: 'orders',
-    query: {
-      MarketplaceIds: [AMAZON_CONFIG.marketplaceId].filter(Boolean),
-      OrderStatuses: ['Unshipped'],
-      FulfillmentChannels: ['MFN']
-    }
-  });
+  const ordersResponse = await retryWithBackoff(
+    () =>
+      sp.callAPI({
+        operation: 'getOrders',
+        endpoint: 'orders',
+        query: {
+          MarketplaceIds: [AMAZON_CONFIG.marketplaceId].filter(Boolean),
+          OrderStatuses: ['Unshipped'],
+          FulfillmentChannels: ['MFN']
+        }
+      }),
+    { context: 'getOrders' }
+  );
 
   const orders = ordersResponse.Orders || [];
 
@@ -56,16 +138,18 @@ export async function fetchUnshippedPrimeOrdersWithItems() {
   const hydrated = [];
 
   for (const order of primeOrders) {
-    // Step C: Hydrate with items (throttle 500ms)
-    await sleep(500);
-
-    const itemsResponse = await sp.callAPI({
-      operation: 'getOrderItems',
-      endpoint: 'orders',
-      path: {
-        orderId: order.AmazonOrderId
-      }
-    });
+    // Step C: Hydrate with items
+    const itemsResponse = await retryWithBackoff(
+      () =>
+        sp.callAPI({
+          operation: 'getOrderItems',
+          endpoint: 'orders',
+          path: {
+            orderId: order.AmazonOrderId
+          }
+        }),
+      { context: `getOrderItems ${order.AmazonOrderId}` }
+    );
 
     const items = (itemsResponse.OrderItems || []).map((item) => ({
       sku: item.SellerSKU,
@@ -94,29 +178,33 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
   const sp = await createSpClient();
 
   // Step A: getEligibleShipmentServices
-  const eligibleResponse = await sp.callAPI({
-    operation: 'getEligibleShipmentServices',
-    endpoint: 'merchantFulfillment',
-    body: {
-      ShipmentRequestDetails: {
-        AmazonOrderId: amazon_order_id,
-        ItemList: [
-          {
-            OrderItemId: amazon_order_id,
-            Quantity: quantity || 1
+  const eligibleResponse = await retryWithBackoff(
+    () =>
+      sp.callAPI({
+        operation: 'getEligibleShipmentServices',
+        endpoint: 'merchantFulfillment',
+        body: {
+          ShipmentRequestDetails: {
+            AmazonOrderId: amazon_order_id,
+            ItemList: [
+              {
+                OrderItemId: amazon_order_id,
+                Quantity: quantity || 1
+              }
+            ],
+            ShipFromAddress: SHIP_FROM_ADDRESS,
+            PackageDimensions: dimensions,
+            Weight: weight,
+            ShippingServiceOptions: {
+              DeliveryExperience: 'DeliveryConfirmationWithoutSignature',
+              CarrierWillPickUp: false,
+              LabelFormat: 'ZPL203'
+            }
           }
-        ],
-        ShipFromAddress: SHIP_FROM_ADDRESS,
-        PackageDimensions: dimensions,
-        Weight: weight,
-        ShippingServiceOptions: {
-          DeliveryExperience: 'DeliveryConfirmationWithoutSignature',
-          CarrierWillPickUp: false,
-          LabelFormat: 'ZPL203'
         }
-      }
-    }
-  });
+      }),
+    { context: `getEligibleShipmentServices ${amazon_order_id}` }
+  );
 
   const services = eligibleResponse.ShippingServiceList || [];
   if (!services.length) {
@@ -129,30 +217,34 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
   }, { service: services[0], cost: Number(services[0].ShippingServiceCost.Amount) || Infinity }).service;
 
   // Step B: createShipment
-  const shipmentResponse = await sp.callAPI({
-    operation: 'createShipment',
-    endpoint: 'merchantFulfillment',
-    body: {
-      ShipmentRequestDetails: {
-        AmazonOrderId: amazon_order_id,
-        ItemList: [
-          {
-            OrderItemId: amazon_order_id,
-            Quantity: quantity || 1
-          }
-        ],
-        ShipFromAddress: SHIP_FROM_ADDRESS,
-        PackageDimensions: dimensions,
-        Weight: weight,
-        ShippingServiceOptions: {
-          DeliveryExperience: 'DeliveryConfirmationWithoutSignature',
-          CarrierWillPickUp: false,
-          LabelFormat: 'ZPL203'
+  const shipmentResponse = await retryWithBackoff(
+    () =>
+      sp.callAPI({
+        operation: 'createShipment',
+        endpoint: 'merchantFulfillment',
+        body: {
+          ShipmentRequestDetails: {
+            AmazonOrderId: amazon_order_id,
+            ItemList: [
+              {
+                OrderItemId: amazon_order_id,
+                Quantity: quantity || 1
+              }
+            ],
+            ShipFromAddress: SHIP_FROM_ADDRESS,
+            PackageDimensions: dimensions,
+            Weight: weight,
+            ShippingServiceOptions: {
+              DeliveryExperience: 'DeliveryConfirmationWithoutSignature',
+              CarrierWillPickUp: false,
+              LabelFormat: 'ZPL203'
+            }
+          },
+          ShippingServiceId: cheapest.ShippingServiceId
         }
-      },
-      ShippingServiceId: cheapest.ShippingServiceId
-    }
-  });
+      }),
+    { context: `createShipment ${amazon_order_id}` }
+  );
 
   const shipment = shipmentResponse.Shipment;
   if (!shipment) {

@@ -27,3 +27,5 @@ Thumbs.db
 # IDE settings (Optional, prevents personal settings from being shared)
 .vscode/
 .idea/
+
+.cursor/

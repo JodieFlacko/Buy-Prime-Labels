@@ -4,6 +4,12 @@ import bodyParser from 'body-parser';
 import { PORT } from './config.js';
 import { initDb, pool } from './db.js';
 import { fetchUnshippedPrimeOrdersWithItems, buyLabel, gunzipBase64Zpl } from './amazonClient.js';
+import {
+  labelLimiter,
+  rateLimitEnabled,
+  readLimiter,
+  syncLimiter
+} from './middleware/rateLimiter.js';
 
 // Extract ZPL injection logic into reusable function
 function injectSkuToZpl(originalZpl, sku, quantity) {
@@ -33,10 +39,167 @@ function injectSkuToZpl(originalZpl, sku, quantity) {
   return modifiedZpl;
 }
 
+const WEIGHT_UNITS = new Set(['oz', 'lb', 'g', 'kg']);
+const DIMENSION_UNITS = new Set(['in', 'cm']);
+const MAX_WEIGHT_LB = 150;
+const MIN_DIMENSION_IN = 0.1;
+const MAX_DIMENSION_IN = 108;
+const MAX_BULK_IDS = 50;
+
+function normalizeNumber(value) {
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return NaN;
+    }
+    return Number(trimmed);
+  }
+  return NaN;
+}
+
+function toInches(value, unit) {
+  return unit === 'cm' ? value / 2.54 : value;
+}
+
+function toPounds(value, unit) {
+  if (unit === 'oz') {
+    return value / 16;
+  }
+  if (unit === 'g') {
+    return value / 453.59237;
+  }
+  if (unit === 'kg') {
+    return value * 2.20462262;
+  }
+  return value;
+}
+
+function computeDimensionalWeightLb(length, width, height, unit) {
+  if (unit === 'cm') {
+    return (length * width * height) / 5000 * 2.20462262;
+  }
+  return (length * width * height) / 139;
+}
+
+/**
+ * Validate label buying payloads for single and bulk requests.
+ * @param {object} payload - Request payload inputs.
+ * @param {string} [payload.amazon_order_id] - Single order id.
+ * @param {string[]} [payload.amazon_order_ids] - Bulk order ids.
+ * @param {object} payload.weight - Weight object with value and unit.
+ * @param {object} payload.dimensions - Dimensions object with length, width, height, unit.
+ * @returns {{ ok: boolean, errors: string[], warnings: string[] }}
+ */
+function validateLabelRequest(payload) {
+  const errors = [];
+  const warnings = [];
+
+  const isBulk = Array.isArray(payload.amazon_order_ids);
+
+  if (isBulk) {
+    const ids = payload.amazon_order_ids;
+    if (ids.length < 1 || ids.length > MAX_BULK_IDS) {
+      errors.push(`amazon_order_ids must contain between 1 and ${MAX_BULK_IDS} order IDs.`);
+    }
+    ids.forEach((id, idx) => {
+      if (typeof id !== 'string' || !id.trim()) {
+        errors.push(`amazon_order_ids[${idx}] must be a non-empty string.`);
+      }
+    });
+  } else {
+    if (typeof payload.amazon_order_id !== 'string' || !payload.amazon_order_id.trim()) {
+      errors.push('amazon_order_id must be a non-empty string.');
+    }
+  }
+
+  const weight = payload.weight;
+  if (!weight || typeof weight !== 'object') {
+    errors.push('weight is required and must be an object.');
+  } else {
+    const weightValue = normalizeNumber(weight.value);
+    const weightUnit = typeof weight.unit === 'string' ? weight.unit.trim() : '';
+    if (!Number.isFinite(weightValue) || weightValue <= 0) {
+      errors.push('weight.value must be a positive number.');
+    }
+    if (!WEIGHT_UNITS.has(weightUnit)) {
+      errors.push(`weight.unit must be one of: ${Array.from(WEIGHT_UNITS).join(', ')}.`);
+    }
+    if (Number.isFinite(weightValue) && WEIGHT_UNITS.has(weightUnit)) {
+      const weightLb = toPounds(weightValue, weightUnit);
+      if (weightLb > MAX_WEIGHT_LB) {
+        errors.push(`weight.value exceeds the ${MAX_WEIGHT_LB} lb limit.`);
+      }
+    }
+  }
+
+  const dimensions = payload.dimensions;
+  if (!dimensions || typeof dimensions !== 'object') {
+    errors.push('dimensions are required and must be an object.');
+  } else {
+    const lengthValue = normalizeNumber(dimensions.length);
+    const widthValue = normalizeNumber(dimensions.width);
+    const heightValue = normalizeNumber(dimensions.height);
+    const dimensionUnit = typeof dimensions.unit === 'string' ? dimensions.unit.trim() : '';
+
+    if (!Number.isFinite(lengthValue) || lengthValue <= 0) {
+      errors.push('dimensions.length must be a positive number.');
+    }
+    if (!Number.isFinite(widthValue) || widthValue <= 0) {
+      errors.push('dimensions.width must be a positive number.');
+    }
+    if (!Number.isFinite(heightValue) || heightValue <= 0) {
+      errors.push('dimensions.height must be a positive number.');
+    }
+    if (!DIMENSION_UNITS.has(dimensionUnit)) {
+      errors.push(`dimensions.unit must be one of: ${Array.from(DIMENSION_UNITS).join(', ')}.`);
+    }
+
+    if (
+      Number.isFinite(lengthValue) &&
+      Number.isFinite(widthValue) &&
+      Number.isFinite(heightValue) &&
+      DIMENSION_UNITS.has(dimensionUnit)
+    ) {
+      const lengthIn = toInches(lengthValue, dimensionUnit);
+      const widthIn = toInches(widthValue, dimensionUnit);
+      const heightIn = toInches(heightValue, dimensionUnit);
+      const dimensionsIn = [
+        { name: 'length', value: lengthIn },
+        { name: 'width', value: widthIn },
+        { name: 'height', value: heightIn }
+      ];
+
+      dimensionsIn.forEach(({ name, value }) => {
+        if (value < MIN_DIMENSION_IN || value > MAX_DIMENSION_IN) {
+          errors.push(`dimensions.${name} must be between ${MIN_DIMENSION_IN} and ${MAX_DIMENSION_IN} inches.`);
+        }
+      });
+
+      const dimensionalWeight = computeDimensionalWeightLb(lengthValue, widthValue, heightValue, dimensionUnit);
+      if (dimensionalWeight > MAX_WEIGHT_LB) {
+        warnings.push(
+          `Dimensional weight is ${dimensionalWeight.toFixed(2)} lb, which exceeds ${MAX_WEIGHT_LB} lb.`
+        );
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors, warnings };
+}
+
 const app = express();
 
 app.use(cors());
 app.use(bodyParser.json());
+
+if (rateLimitEnabled) {
+  app.use('/api/sync-orders', syncLimiter);
+  app.use(['/api/buy-label', '/api/bulk-buy-labels'], labelLimiter);
+  app.use(['/api/orders', '/api/health'], readLimiter);
+}
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -82,11 +245,15 @@ app.get('/api/orders', async (req, res) => {
 
 // Sync Logic (/api/sync-orders)
 app.post('/api/sync-orders', async (req, res) => {
+  const client = await pool.connect();
   try {
     const orders = await fetchUnshippedPrimeOrdersWithItems();
 
     let inserted = 0;
     let updated = 0;
+
+    await client.query('BEGIN');
+
     for (const order of orders) {
       const {
         amazon_order_id,
@@ -98,69 +265,55 @@ app.post('/api/sync-orders', async (req, res) => {
         status
       } = order;
 
-      // Check if order already exists and its current status
-      const existingResult = await pool.query(
-        'SELECT status FROM orders WHERE amazon_order_id = $1',
-        [amazon_order_id]
+      const result = await client.query(
+        `
+          INSERT INTO orders
+          (amazon_order_id, purchase_date, customer_name, shipping_address, items, is_prime, status)
+          VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'Unshipped'))
+          ON CONFLICT (amazon_order_id)
+          DO UPDATE SET
+            purchase_date = EXCLUDED.purchase_date,
+            customer_name = EXCLUDED.customer_name,
+            shipping_address = EXCLUDED.shipping_address,
+            items = EXCLUDED.items,
+            is_prime = EXCLUDED.is_prime,
+            status = EXCLUDED.status
+          WHERE orders.status != 'LabelBought'
+          RETURNING (xmax = 0) AS inserted
+        `,
+        [
+          amazon_order_id,
+          purchase_date ? new Date(purchase_date) : null,
+          customer_name,
+          shipping_address,
+          JSON.stringify(items || []),
+          is_prime,
+          status
+        ]
       );
 
-      if (existingResult.rowCount === 0) {
-        // Insert new order
-        const result = await pool.query(
-          `
-            INSERT INTO orders
-            (amazon_order_id, purchase_date, customer_name, shipping_address, items, is_prime, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-          `,
-          [
-            amazon_order_id,
-            purchase_date ? new Date(purchase_date) : null,
-            customer_name,
-            shipping_address,
-            JSON.stringify(items || []),
-            is_prime,
-            status || 'Unshipped'
-          ]
-        );
-
-        if (result.rowCount === 1) {
+      if (result.rowCount === 1) {
+        if (result.rows[0].inserted) {
           inserted += 1;
-        }
-      } else {
-        // Order exists - only update if it's not already 'LabelBought'
-        const existingStatus = existingResult.rows[0].status;
-        if (existingStatus !== 'LabelBought') {
-          // Update order but preserve status if it's already 'LabelBought' in DB
-          await pool.query(
-            `
-              UPDATE orders
-              SET purchase_date = $1,
-                  customer_name = $2,
-                  shipping_address = $3,
-                  items = $4,
-                  is_prime = $5,
-                  status = COALESCE($6, 'Unshipped')
-              WHERE amazon_order_id = $7 AND status != 'LabelBought'
-            `,
-            [
-              purchase_date ? new Date(purchase_date) : null,
-              customer_name,
-              shipping_address,
-              JSON.stringify(items || []),
-              is_prime,
-              status || 'Unshipped',
-              amazon_order_id
-            ]
-          );
+        } else {
           updated += 1;
         }
       }
     }
 
+    await client.query('COMMIT');
+
     res.json({ synced: orders.length, inserted, updated });
   } catch (err) {
     console.error('Error syncing orders', err);
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Error rolling back sync-orders transaction', rollbackErr);
+    }
     res.status(500).json({ error: 'Failed to sync orders from Amazon.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -168,11 +321,18 @@ app.post('/api/sync-orders', async (req, res) => {
 app.post('/api/buy-label', async (req, res) => {
   const { amazon_order_id, weight, dimensions } = req.body || {};
 
-  if (!amazon_order_id || !weight || !dimensions) {
-    return res.status(400).json({ error: 'amazon_order_id, weight, and dimensions are required.' });
+  const validation = validateLabelRequest({ amazon_order_id, weight, dimensions });
+  if (!validation.ok) {
+    return res.status(400).json({
+      error: 'Invalid request.',
+      details: validation.errors
+    });
   }
 
   try {
+    if (validation.warnings.length) {
+      console.warn('buy-label validation warnings', validation.warnings);
+    }
     // Get SKU/Qty from DB
     const orderResult = await pool.query(
       'SELECT items FROM orders WHERE amazon_order_id = $1',
@@ -242,7 +402,8 @@ app.post('/api/buy-label', async (req, res) => {
     res.json({
       amazon_order_id,
       zpl: modifiedZpl,
-      trackingId: trackingId || null
+      trackingId: trackingId || null,
+      warnings: validation.warnings.length ? validation.warnings : undefined
     });
   } catch (err) {
     console.error('Error buying label', err);
@@ -254,12 +415,16 @@ app.post('/api/buy-label', async (req, res) => {
 app.post('/api/bulk-buy-labels', async (req, res) => {
   const { amazon_order_ids, weight, dimensions } = req.body || {};
 
-  if (!amazon_order_ids || !Array.isArray(amazon_order_ids) || amazon_order_ids.length === 0) {
-    return res.status(400).json({ error: 'amazon_order_ids array is required and must not be empty.' });
+  const validation = validateLabelRequest({ amazon_order_ids, weight, dimensions });
+  if (!validation.ok) {
+    return res.status(400).json({
+      error: 'Invalid request.',
+      details: validation.errors
+    });
   }
 
-  if (!weight || !dimensions) {
-    return res.status(400).json({ error: 'weight and dimensions are required.' });
+  if (validation.warnings.length) {
+    console.warn('bulk-buy-labels validation warnings', validation.warnings);
   }
 
   const results = {
@@ -334,6 +499,7 @@ app.post('/api/bulk-buy-labels', async (req, res) => {
     succeeded: results.succeeded,
     failed: results.failed,
     zpl: results.combinedZpl,
+    warnings: validation.warnings.length ? validation.warnings : undefined,
     summary: {
       total: amazon_order_ids.length,
       succeeded: results.succeeded.length,

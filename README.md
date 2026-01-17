@@ -55,6 +55,15 @@ DATABASE_URL=postgres://user:password@localhost:5432/prime_orders
 # Toggle mock mode (no Amazon calls)
 USE_MOCK=true
 
+# Rate limiting (disable in development by default)
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_SYNC_MAX=10
+RATE_LIMIT_SYNC_WINDOW_MS=3600000
+RATE_LIMIT_LABEL_MAX=30
+RATE_LIMIT_LABEL_WINDOW_MS=3600000
+RATE_LIMIT_READ_MAX=100
+RATE_LIMIT_READ_WINDOW_MS=60000
+
 # Amazon SP-API (required when USE_MOCK=false)
 # Defaults configured for Italy (Marketplace ID: APJ6JRA9NG5V4)
 SELLER_ID=...

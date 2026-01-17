@@ -31,3 +31,34 @@ export const AMAZON_CONFIG = {
   roleArn: process.env.AWS_SELLING_PARTNER_ROLE_ARN
 };
 
+function parseBoolean(value, defaultValue) {
+  if (typeof value !== 'string') {
+    return defaultValue;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
+
+function parsePositiveInt(value, defaultValue) {
+  if (typeof value !== 'string') {
+    return defaultValue;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
+
+export const RATE_LIMIT_ENABLED = parseBoolean(
+  process.env.RATE_LIMIT_ENABLED,
+  process.env.NODE_ENV !== 'development'
+);
+
+export const RATE_LIMIT_SYNC_MAX = parsePositiveInt(process.env.RATE_LIMIT_SYNC_MAX, 10);
+export const RATE_LIMIT_SYNC_WINDOW_MS = parsePositiveInt(process.env.RATE_LIMIT_SYNC_WINDOW_MS, HOUR_MS);
+
+export const RATE_LIMIT_LABEL_MAX = parsePositiveInt(process.env.RATE_LIMIT_LABEL_MAX, 30);
+export const RATE_LIMIT_LABEL_WINDOW_MS = parsePositiveInt(process.env.RATE_LIMIT_LABEL_WINDOW_MS, HOUR_MS);
+
+export const RATE_LIMIT_READ_MAX = parsePositiveInt(process.env.RATE_LIMIT_READ_MAX, 100);
+export const RATE_LIMIT_READ_WINDOW_MS = parsePositiveInt(process.env.RATE_LIMIT_READ_WINDOW_MS, MINUTE_MS);
