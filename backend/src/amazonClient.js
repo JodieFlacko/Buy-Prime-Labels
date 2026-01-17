@@ -1,7 +1,7 @@
 import zlib from 'zlib';
 import SellingPartnerAPI from 'amazon-sp-api';
 import { AMAZON_CONFIG, SHIP_FROM_ADDRESS, USE_MOCK } from './config.js';
-import { mockFetchUnshippedPrimeOrdersWithItems, mockBuyLabel } from './mock_api.js';
+import { mockFetchUnshippedPrimeOrdersWithItems, mockGetOrderItems, mockBuyLabel } from './mock_api.js';
 import { logger } from './logger.js';
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -115,62 +115,92 @@ async function createSpClient() {
 }
 
 export async function fetchUnshippedPrimeOrdersWithItems() {
+  // Step 1: Create SP client if using real API (create once, reuse for all calls)
+  const sp = USE_MOCK ? null : await createSpClient();
+
+  // Step 2: Fetch orders from Amazon API (or mock)
+  // Both return Amazon's format: { payload: { Orders: [...] } }
+  let ordersResponse;
+  
   if (USE_MOCK) {
-    return mockFetchUnshippedPrimeOrdersWithItems();
+    ordersResponse = await mockFetchUnshippedPrimeOrdersWithItems();
+  } else {
+    ordersResponse = await retryWithBackoff(
+      () =>
+        sp.callAPI({
+          operation: 'getOrders',
+          endpoint: 'orders',
+          query: {
+            MarketplaceIds: [AMAZON_CONFIG.marketplaceId].filter(Boolean),
+            OrderStatuses: ['Unshipped'],
+            FulfillmentChannels: ['MFN']
+          }
+        }),
+      { context: 'getOrders' }
+    );
   }
 
-  const sp = await createSpClient();
+  // Step 3: Extract orders from payload wrapper (Amazon SP-API format)
+  const orders = ordersResponse?.payload?.Orders || ordersResponse?.Orders || [];
+  
+  if (!orders.length) {
+    logger.info('No unshipped orders found', { operation: 'fetchUnshippedPrimeOrdersWithItems' });
+    return [];
+  }
 
-  // Step A: GET /orders/v0/orders
-  const ordersResponse = await retryWithBackoff(
-    () =>
-      sp.callAPI({
-        operation: 'getOrders',
-        endpoint: 'orders',
-        query: {
-          MarketplaceIds: [AMAZON_CONFIG.marketplaceId].filter(Boolean),
-          OrderStatuses: ['Unshipped'],
-          FulfillmentChannels: ['MFN']
-        }
-      }),
-    { context: 'getOrders' }
-  );
-
-  const orders = ordersResponse.Orders || [];
-
+  // Step 4: Filter for Prime orders using Amazon's IsPrime field (PascalCase)
   const primeOrders = orders.filter((o) => o.IsPrime);
 
+  // Step 5: Hydrate each Prime order with its items and transform to our format
   const hydrated = [];
 
   for (const order of primeOrders) {
-    // Step C: Hydrate with items
-    const itemsResponse = await retryWithBackoff(
-      () =>
-        sp.callAPI({
-          operation: 'getOrderItems',
-          endpoint: 'orders',
-          path: {
-            orderId: order.AmazonOrderId
-          }
-        }),
-      { context: `getOrderItems ${order.AmazonOrderId}` }
-    );
+    // Fetch order items from Amazon API (or mock)
+    // Both return Amazon's format: { payload: { OrderItems: [...] } }
+    let itemsResponse;
+    
+    if (USE_MOCK) {
+      itemsResponse = await mockGetOrderItems(order.AmazonOrderId);
+    } else {
+      itemsResponse = await retryWithBackoff(
+        () =>
+          sp.callAPI({
+            operation: 'getOrderItems',
+            endpoint: 'orders',
+            path: {
+              orderId: order.AmazonOrderId
+            }
+          }),
+        { context: `getOrderItems ${order.AmazonOrderId}` }
+      );
+    }
 
-    const items = (itemsResponse.OrderItems || []).map((item) => ({
-      sku: item.SellerSKU,
-      quantity: item.QuantityOrdered
+    // Extract order items from payload wrapper
+    const orderItems = itemsResponse?.payload?.OrderItems || itemsResponse?.OrderItems || [];
+    
+    // Step 6: Transform Amazon's PascalCase fields to our snake_case database format
+    // This transformation happens consistently for both mock and real API
+    const items = orderItems.map((item) => ({
+      sku: item.SellerSKU,           // PascalCase → snake_case
+      quantity: item.QuantityOrdered  // PascalCase → snake_case
     }));
 
     hydrated.push({
-      amazon_order_id: order.AmazonOrderId,
-      purchase_date: order.PurchaseDate,
-      customer_name: (order.ShippingAddress && order.ShippingAddress.Name) || 'Unknown',
-      shipping_address: order.ShippingAddress || {},
-      items,
-      is_prime: !!order.IsPrime,
-      status: order.OrderStatus || 'Unshipped'
+      amazon_order_id: order.AmazonOrderId,                                            // PascalCase → snake_case
+      purchase_date: order.PurchaseDate,                                               // PascalCase → snake_case
+      customer_name: (order.ShippingAddress && order.ShippingAddress.Name) || 'Unknown', // Extract from nested object
+      shipping_address: order.ShippingAddress || {},                                   // Keep the full address object
+      items,                                                                           // Already transformed above
+      is_prime: !!order.IsPrime,                                                       // PascalCase → snake_case
+      status: order.OrderStatus || 'Unshipped'                                         // PascalCase → snake_case
     });
   }
+
+  logger.info('Fetched Prime orders with items', { 
+    operation: 'fetchUnshippedPrimeOrdersWithItems',
+    totalOrders: orders.length,
+    primeOrders: primeOrders.length
+  });
 
   return hydrated;
 }
@@ -183,6 +213,7 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
   const sp = await createSpClient();
 
   // Step A: getEligibleShipmentServices
+  // Amazon SP-API returns: { payload: { ShippingServiceList: [...] } }
   const eligibleResponse = await retryWithBackoff(
     () =>
       sp.callAPI({
@@ -211,17 +242,29 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
     { context: `getEligibleShipmentServices ${amazon_order_id}` }
   );
 
-  const services = eligibleResponse.ShippingServiceList || [];
+  // Extract shipping services from payload wrapper
+  const services = eligibleResponse?.payload?.ShippingServiceList || 
+                   eligibleResponse?.ShippingServiceList || [];
+  
   if (!services.length) {
     throw new Error('No eligible shipping services returned from Amazon.');
   }
 
+  // Find cheapest eligible shipping service
   const cheapest = services.reduce((min, s) => {
     const cost = Number(s.ShippingServiceCost && s.ShippingServiceCost.Amount) || Infinity;
     return cost < min.cost ? { service: s, cost } : min;
   }, { service: services[0], cost: Number(services[0].ShippingServiceCost.Amount) || Infinity }).service;
 
+  logger.info('Selected shipping service', {
+    operation: 'buyLabel',
+    amazon_order_id,
+    serviceId: cheapest.ShippingServiceId,
+    cost: cheapest.ShippingServiceCost?.Amount
+  });
+
   // Step B: createShipment
+  // Amazon SP-API returns: { payload: { Shipment: { Label: {...}, TrackingId: "..." } } }
   const shipmentResponse = await retryWithBackoff(
     () =>
       sp.callAPI({
@@ -251,18 +294,35 @@ export async function buyLabel({ amazon_order_id, weight, dimensions, sku, quant
     { context: `createShipment ${amazon_order_id}` }
   );
 
-  const shipment = shipmentResponse.Shipment;
+  // Extract shipment from payload wrapper
+  const shipment = shipmentResponse?.payload?.Shipment || shipmentResponse?.Shipment;
+  
   if (!shipment) {
     throw new Error('Shipment data missing in createShipment response.');
   }
 
   const labelDetails = shipment.Label;
-  if (!labelDetails || !labelDetails.FileContents || !labelDetails.FileContents.Data) {
+  if (!labelDetails || !labelDetails.FileContents) {
     throw new Error('Label data missing in createShipment response.');
   }
 
-  const base64Gzipped = labelDetails.FileContents.Data;
+  // Amazon returns the label in FileContents.Contents (base64-encoded gzipped ZPL)
+  // Note: Some APIs use "Data" and others use "Contents" - handle both
+  const base64Gzipped = labelDetails.FileContents.Contents || 
+                        labelDetails.FileContents.Data;
+  
+  if (!base64Gzipped) {
+    throw new Error('Label file contents missing in createShipment response.');
+  }
+
   const trackingId = shipment.TrackingId || null;
+
+  logger.info('Label purchased successfully', {
+    operation: 'buyLabel',
+    amazon_order_id,
+    trackingId,
+    hasLabel: !!base64Gzipped
+  });
 
   return {
     labelGzipped: base64Gzipped,
