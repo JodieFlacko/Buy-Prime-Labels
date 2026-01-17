@@ -4,10 +4,12 @@
   "private": true,
   "description": "Internal tool to sync Amazon Prime orders, buy ZPL labels, and inject SKU/Qty footer.",
   "scripts": {
-    "dev:backend": "cd backend && npm run dev",
-    "dev:frontend": "cd frontend && npm run dev",
-    "dev": "npm run dev:backend && npm run dev:frontend",
-    "start": "cd backend && npm start"
+  "dev:backend": "cd backend && npm run dev",
+  "dev:frontend": "cd frontend && npm run dev",
+  "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+  "start": "concurrently \"cd backend && npm start\" \"cd frontend && npm start\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
   }
 }
-
