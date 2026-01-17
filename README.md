@@ -64,6 +64,10 @@ RATE_LIMIT_LABEL_WINDOW_MS=3600000
 RATE_LIMIT_READ_MAX=100
 RATE_LIMIT_READ_WINDOW_MS=60000
 
+# ZPL injection defaults (optional)
+ZPL_INJECT_X=50
+ZPL_INJECT_Y=1100
+
 # Amazon SP-API (required when USE_MOCK=false)
 # Defaults configured for Italy (Marketplace ID: APJ6JRA9NG5V4)
 SELLER_ID=...

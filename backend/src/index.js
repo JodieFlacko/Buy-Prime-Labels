@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import { PORT } from './config.js';
+import { PORT, ZPL_INJECT_X, ZPL_INJECT_Y, validateEnvironment } from './config.js';
 import { initDb, pool } from './db.js';
 import { fetchUnshippedPrimeOrdersWithItems, buyLabel, gunzipBase64Zpl } from './amazonClient.js';
 import {
@@ -10,33 +10,234 @@ import {
   readLimiter,
   syncLimiter
 } from './middleware/rateLimiter.js';
+import { errorHandler, notFoundHandler, registerProcessHandlers } from './middleware/errorHandler.js';
+import { logger } from './logger.js';
 
-// Extract ZPL injection logic into reusable function
-function injectSkuToZpl(originalZpl, sku, quantity) {
-  const skuText = sku || 'UNKNOWN';
-  const qtyText = quantity || 1;
+const ZPL_INJECT_BOX_WIDTH = 700;
+const ZPL_INJECT_BOX_HEIGHT = 60;
+const ZPL_MAX_SKU_LENGTH = 20;
 
-  const injectionBlock = [
-    '^FO50,1100^GB700,60,3^FS',
-    `^FO50,1120^A0N,30,30^FD SKU: ${skuText}  QTY: ${qtyText}^FS`
-  ].join('\n');
+function parseZplNumber(field, zpl) {
+  const match = zpl.match(new RegExp(`\\^${field}(\\d+)`, 'i'));
+  return match ? Number.parseInt(match[1], 10) : null;
+}
 
-  // Inject block immediately before ^XZ
-  const marker = '^XZ';
-  const idx = originalZpl.lastIndexOf(marker);
-  let modifiedZpl;
+function countOccurrences(haystack, needle) {
+  if (!needle) {
+    return 0;
+  }
+  return haystack.split(needle).length - 1;
+}
 
-  if (idx === -1) {
-    modifiedZpl = `${originalZpl.trim()}\n${injectionBlock}\n${marker}\n`;
-  } else {
-    modifiedZpl =
-      originalZpl.slice(0, idx) +
-      injectionBlock +
-      '\n' +
-      originalZpl.slice(idx);
+/**
+ * Validate minimal ZPL structure.
+ * - Ensures required ^XA (start) and ^XZ (end) markers exist and are ordered.
+ * - Flags suspicious patterns such as multiple headers/footers or missing size hints.
+ * - Returns errors for invalid structure and warnings for non-fatal anomalies.
+ * @param {string} zpl - Raw ZPL string.
+ * @returns {{ ok: boolean, errors: string[], warnings: string[], meta: { startIndex: number, endIndex: number, printWidth: number|null, labelLength: number|null } }}
+ */
+export function validateZpl(zpl) {
+  const errors = [];
+  const warnings = [];
+
+  if (typeof zpl !== 'string' || !zpl.trim()) {
+    errors.push('ZPL payload is empty.');
+    return {
+      ok: false,
+      errors,
+      warnings,
+      meta: { startIndex: -1, endIndex: -1, printWidth: null, labelLength: null }
+    };
   }
 
-  return modifiedZpl;
+  const startIndex = zpl.indexOf('^XA');
+  const endIndex = zpl.lastIndexOf('^XZ');
+
+  if (startIndex === -1) {
+    errors.push('Missing ^XA start marker.');
+  }
+  if (endIndex === -1) {
+    errors.push('Missing ^XZ end marker.');
+  }
+  if (startIndex !== -1 && endIndex !== -1 && endIndex < startIndex) {
+    errors.push('^XZ end marker appears before ^XA start marker.');
+  }
+
+  const xaCount = countOccurrences(zpl, '^XA');
+  const xzCount = countOccurrences(zpl, '^XZ');
+  if (xaCount > 1) {
+    warnings.push('Multiple ^XA markers detected.');
+  }
+  if (xzCount > 1) {
+    warnings.push('Multiple ^XZ markers detected.');
+  }
+  if (endIndex !== -1 && endIndex < zpl.length - 2) {
+    warnings.push('Trailing content detected after final ^XZ marker.');
+  }
+
+  const printWidth = parseZplNumber('PW', zpl);
+  const labelLength = parseZplNumber('LL', zpl);
+  if (printWidth === null) {
+    warnings.push('Missing ^PW (print width) definition.');
+  }
+  if (labelLength === null) {
+    warnings.push('Missing ^LL (label length) definition.');
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    meta: { startIndex, endIndex, printWidth, labelLength }
+  };
+}
+
+function coerceOverride(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  }
+  return null;
+}
+
+function truncateSku(skuText) {
+  if (skuText.length <= ZPL_MAX_SKU_LENGTH) {
+    return { value: skuText, truncated: false };
+  }
+  const trimmed = `${skuText.slice(0, ZPL_MAX_SKU_LENGTH - 3)}...`;
+  return { value: trimmed, truncated: true };
+}
+
+/**
+ * Inject SKU/QTY metadata into ZPL with safety checks.
+ * - Validates ^XA/^XZ markers and basic structural integrity before mutation.
+ * - Uses configured coordinates with optional overrides per request.
+ * - Ensures injection stays within ^PW/^LL bounds when provided by the label.
+ * - Truncates long SKU values (max 20 chars) to avoid ZPL overflow.
+ * - Supports dry-run mode that validates without mutation.
+ * @param {string} originalZpl - Source ZPL string.
+ * @param {string} sku - SKU text (will be sanitized and truncated).
+ * @param {number} quantity - Quantity to display.
+ * @param {{ x?: number|string, y?: number|string, dryRun?: boolean }} [options]
+ * @returns {{ success: boolean, zpl: string, error?: string }}
+ */
+function injectSkuToZpl(originalZpl, sku, quantity, options = {}) {
+  const validation = validateZpl(originalZpl);
+  if (!validation.ok) {
+    const error = validation.errors.join(' ');
+    logger.error('Invalid ZPL, injection skipped', {
+      operation: 'zpl.inject.validate',
+      error,
+      warnings: validation.warnings
+    });
+    return { success: false, zpl: originalZpl, error };
+  }
+
+  if (validation.warnings.length) {
+    logger.warn('Suspicious ZPL patterns detected', {
+      operation: 'zpl.inject.validate',
+      warnings: validation.warnings
+    });
+  }
+
+  const overrideX = coerceOverride(options.x);
+  const overrideY = coerceOverride(options.y);
+  const injectX = overrideX ?? ZPL_INJECT_X;
+  const injectY = overrideY ?? ZPL_INJECT_Y;
+
+  const skuText = typeof sku === 'string' && sku.trim() ? sku.trim() : 'UNKNOWN';
+  const qtyText = Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+  const { value: safeSkuText, truncated } = truncateSku(skuText);
+
+  if (truncated) {
+    logger.warn('SKU truncated for ZPL injection', {
+      operation: 'zpl.inject.truncate',
+      originalSku: skuText,
+      truncatedSku: safeSkuText
+    });
+  }
+
+  if (injectX < 0 || injectY < 0) {
+    return { success: false, zpl: originalZpl, error: 'Injection coordinates must be non-negative.' };
+  }
+
+  if (validation.meta.printWidth !== null) {
+    const maxX = injectX + ZPL_INJECT_BOX_WIDTH;
+    if (maxX > validation.meta.printWidth) {
+      return {
+        success: false,
+        zpl: originalZpl,
+        error: `Injection exceeds label width (${maxX} > ${validation.meta.printWidth}).`
+      };
+    }
+  }
+
+  if (validation.meta.labelLength !== null) {
+    const maxY = injectY + ZPL_INJECT_BOX_HEIGHT;
+    if (maxY > validation.meta.labelLength) {
+      return {
+        success: false,
+        zpl: originalZpl,
+        error: `Injection exceeds label length (${maxY} > ${validation.meta.labelLength}).`
+      };
+    }
+  }
+
+  const injectionBlock = [
+    `^FO${injectX},${injectY}^GB${ZPL_INJECT_BOX_WIDTH},${ZPL_INJECT_BOX_HEIGHT},3^FS`,
+    `^FO${injectX},${injectY + 20}^A0N,30,30^FD SKU: ${safeSkuText}  QTY: ${qtyText}^FS`
+  ].join('\n');
+
+  if (options.dryRun) {
+    return { success: true, zpl: originalZpl };
+  }
+
+  const marker = '^XZ';
+  const idx = validation.meta.endIndex;
+  const modifiedZpl =
+    originalZpl.slice(0, idx) +
+    injectionBlock +
+    '\n' +
+    originalZpl.slice(idx);
+
+  const postValidation = validateZpl(modifiedZpl);
+  if (!postValidation.ok) {
+    const error = postValidation.errors.join(' ');
+    logger.error('ZPL validation failed after injection', {
+      operation: 'zpl.inject.postValidate',
+      error,
+      warnings: postValidation.warnings
+    });
+    return { success: false, zpl: originalZpl, error };
+  }
+
+  return { success: true, zpl: modifiedZpl };
+}
+
+function getZplInjectOptions(payload = {}) {
+  const x = coerceOverride(payload.zpl_inject_x);
+  const y = coerceOverride(payload.zpl_inject_y);
+  const options = {};
+
+  if (x !== null) {
+    options.x = x;
+  }
+  if (y !== null) {
+    options.y = y;
+  }
+  if (payload.zpl_inject_dry_run === true) {
+    options.dryRun = true;
+  }
+
+  return options;
 }
 
 const WEIGHT_UNITS = new Set(['oz', 'lb', 'g', 'kg']);
@@ -195,6 +396,8 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+registerProcessHandlers();
+
 if (rateLimitEnabled) {
   app.use('/api/sync-orders', syncLimiter);
   app.use(['/api/buy-label', '/api/bulk-buy-labels'], labelLimiter);
@@ -225,7 +428,11 @@ app.get('/api/shipping-defaults/:sku', async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Error fetching shipping defaults', err);
+    logger.error('Error fetching shipping defaults', {
+      operation: 'shippingDefaults.fetch',
+      input: { sku },
+      error: err
+    });
     res.status(500).json({ error: 'Failed to fetch shipping defaults.' });
   }
 });
@@ -238,7 +445,10 @@ app.get('/api/orders', async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    console.error('Error fetching orders from DB', err);
+    logger.error('Error fetching orders from DB', {
+      operation: 'orders.list',
+      error: err
+    });
     res.status(500).json({ error: 'Failed to fetch orders from database.' });
   }
 });
@@ -305,11 +515,17 @@ app.post('/api/sync-orders', async (req, res) => {
 
     res.json({ synced: orders.length, inserted, updated });
   } catch (err) {
-    console.error('Error syncing orders', err);
+    logger.error('Error syncing orders', {
+      operation: 'orders.sync',
+      error: err
+    });
     try {
       await client.query('ROLLBACK');
     } catch (rollbackErr) {
-      console.error('Error rolling back sync-orders transaction', rollbackErr);
+      logger.error('Error rolling back sync-orders transaction', {
+        operation: 'orders.sync.rollback',
+        error: rollbackErr
+      });
     }
     res.status(500).json({ error: 'Failed to sync orders from Amazon.' });
   } finally {
@@ -320,6 +536,7 @@ app.post('/api/sync-orders', async (req, res) => {
 // Buy Label Logic (/api/buy-label)
 app.post('/api/buy-label', async (req, res) => {
   const { amazon_order_id, weight, dimensions } = req.body || {};
+  const zplInjectOptions = getZplInjectOptions(req.body || {});
 
   const validation = validateLabelRequest({ amazon_order_id, weight, dimensions });
   if (!validation.ok) {
@@ -331,7 +548,11 @@ app.post('/api/buy-label', async (req, res) => {
 
   try {
     if (validation.warnings.length) {
-      console.warn('buy-label validation warnings', validation.warnings);
+      logger.warn('buy-label validation warnings', {
+        operation: 'label.buy.validate',
+        warnings: validation.warnings,
+        input: { amazon_order_id, weight, dimensions }
+      });
     }
     // Get SKU/Qty from DB
     const orderResult = await pool.query(
@@ -358,8 +579,25 @@ app.post('/api/buy-label', async (req, res) => {
     // Step C1: Decode (Gunzip)
     const originalZpl = gunzipBase64Zpl(labelGzipped);
 
-    // Use the extracted injection function
-    const modifiedZpl = injectSkuToZpl(originalZpl, sku || firstItem.sku, quantity || firstItem.quantity);
+    const injectionResult = injectSkuToZpl(
+      originalZpl,
+      sku || firstItem.sku,
+      quantity || firstItem.quantity,
+      zplInjectOptions
+    );
+
+    if (!injectionResult.success) {
+      logger.error('ZPL injection failed for buy-label', {
+        operation: 'label.buy.injectZpl',
+        input: { amazon_order_id },
+        error: injectionResult.error
+      });
+      return res.status(500).json({
+        error: injectionResult.error || 'Failed to inject ZPL.'
+      });
+    }
+
+    const modifiedZpl = injectionResult.zpl;
 
     // Update order status to 'LabelBought', save tracking_id, and save the modified ZPL
     await pool.query(
@@ -403,10 +641,15 @@ app.post('/api/buy-label', async (req, res) => {
       amazon_order_id,
       zpl: modifiedZpl,
       trackingId: trackingId || null,
-      warnings: validation.warnings.length ? validation.warnings : undefined
+      warnings: validation.warnings.length ? validation.warnings : undefined,
+      dryRun: zplInjectOptions.dryRun === true ? true : undefined
     });
   } catch (err) {
-    console.error('Error buying label', err);
+    logger.error('Error buying label', {
+      operation: 'label.buy',
+      input: { amazon_order_id, weight, dimensions },
+      error: err
+    });
     res.status(500).json({ error: 'Failed to buy label from Amazon.' });
   }
 });
@@ -414,6 +657,7 @@ app.post('/api/buy-label', async (req, res) => {
 // Bulk Buy Labels Logic (/api/bulk-buy-labels)
 app.post('/api/bulk-buy-labels', async (req, res) => {
   const { amazon_order_ids, weight, dimensions } = req.body || {};
+  const zplInjectOptions = getZplInjectOptions(req.body || {});
 
   const validation = validateLabelRequest({ amazon_order_ids, weight, dimensions });
   if (!validation.ok) {
@@ -424,7 +668,11 @@ app.post('/api/bulk-buy-labels', async (req, res) => {
   }
 
   if (validation.warnings.length) {
-    console.warn('bulk-buy-labels validation warnings', validation.warnings);
+    logger.warn('bulk-buy-labels validation warnings', {
+      operation: 'label.bulkBuy.validate',
+      warnings: validation.warnings,
+      input: { amazon_order_ids, weight, dimensions }
+    });
   }
 
   const results = {
@@ -465,8 +713,22 @@ app.post('/api/bulk-buy-labels', async (req, res) => {
       // Decode (Gunzip)
       const originalZpl = gunzipBase64Zpl(labelGzipped);
 
-      // Inject SKU/Qty metadata
-      const modifiedZpl = injectSkuToZpl(originalZpl, sku || firstItem.sku, quantity || firstItem.quantity);
+      const injectionResult = injectSkuToZpl(
+        originalZpl,
+        sku || firstItem.sku,
+        quantity || firstItem.quantity,
+        zplInjectOptions
+      );
+
+      if (!injectionResult.success) {
+        results.failed.push({
+          amazon_order_id,
+          error: injectionResult.error || 'Failed to inject ZPL.'
+        });
+        continue;
+      }
+
+      const modifiedZpl = injectionResult.zpl;
 
       // Append to combined ZPL (add newline between labels)
       if (results.combinedZpl) {
@@ -485,7 +747,11 @@ app.post('/api/bulk-buy-labels', async (req, res) => {
         trackingId: trackingId || null
       });
     } catch (err) {
-      console.error(`Error processing order ${amazon_order_id}:`, err);
+      logger.error('Error processing order for bulk buy', {
+        operation: 'label.bulkBuy.process',
+        input: { amazon_order_id, weight, dimensions },
+        error: err
+      });
       results.failed.push({
         amazon_order_id,
         error: err.message || String(err)
@@ -500,6 +766,7 @@ app.post('/api/bulk-buy-labels', async (req, res) => {
     failed: results.failed,
     zpl: results.combinedZpl,
     warnings: validation.warnings.length ? validation.warnings : undefined,
+    dryRun: zplInjectOptions.dryRun === true ? true : undefined,
     summary: {
       total: amazon_order_ids.length,
       succeeded: results.succeeded.length,
@@ -538,7 +805,11 @@ app.get('/api/reprint/:orderId', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${orderId}.zpl"`);
     res.send(labelZpl);
   } catch (err) {
-    console.error('Error reprinting label', err);
+    logger.error('Error reprinting label', {
+      operation: 'label.reprint',
+      input: { orderId },
+      error: err
+    });
     res.status(500).json({ error: 'Failed to reprint label.' });
   }
 });
@@ -594,7 +865,11 @@ app.post('/api/bulk-reprint', async (req, res) => {
         amazon_order_id
       });
     } catch (err) {
-      console.error(`Error processing reprint for order ${amazon_order_id}:`, err);
+      logger.error('Error processing reprint for order', {
+        operation: 'label.bulkReprint.process',
+        input: { amazon_order_id },
+        error: err
+      });
       results.failed.push({
         amazon_order_id,
         error: err.message || String(err)
@@ -615,14 +890,24 @@ app.post('/api/bulk-reprint', async (req, res) => {
   });
 });
 
+app.use(notFoundHandler);
+app.use(errorHandler);
+
 async function start() {
   try {
+    validateEnvironment();
     await initDb();
     app.listen(PORT, () => {
-      console.log(`Backend API listening on port ${PORT}`);
+      logger.info('Backend API listening', {
+        operation: 'server.listen',
+        port: PORT
+      });
     });
   } catch (err) {
-    console.error('Failed to start server', err);
+    logger.error('Failed to start server', {
+      operation: 'server.start',
+      error: err
+    });
     process.exit(1);
   }
 }

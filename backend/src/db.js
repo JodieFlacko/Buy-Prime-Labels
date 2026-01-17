@@ -1,13 +1,14 @@
 import pkg from 'pg';
 import { DATABASE_URL } from './config.js';
+import { logger } from './logger.js';
 
 const { Pool } = pkg;
 
-if (!DATABASE_URL) {
-  console.error('\n❌ ERROR: DATABASE_URL is not set in your .env file.');
-  console.error('Please set DATABASE_URL in backend/.env');
-  console.error('Example: DATABASE_URL=postgres://user:password@localhost:5432/prime_orders\n');
-  process.exit(1);
+function maskDatabaseUrl(url) {
+  if (typeof url !== 'string') {
+    return url;
+  }
+  return url.replace(/:[^:@]+@/, ':****@');
 }
 
 export const pool = new Pool({
@@ -18,14 +19,19 @@ export const pool = new Pool({
 
 // Handle pool errors
 pool.on('error', (err) => {
-  console.error('Unexpected PostgreSQL pool error:', err);
+  logger.error('Unexpected PostgreSQL pool error', {
+    operation: 'db.pool.error',
+    error: err
+  });
 });
 
 export async function initDb() {
   let client;
   try {
     client = await pool.connect();
-    console.log('✅ Connected to PostgreSQL database');
+    logger.info('Connected to PostgreSQL database', {
+      operation: 'db.connect'
+    });
     
     await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
@@ -51,7 +57,9 @@ export async function initDb() {
       ALTER TABLE orders 
       ADD COLUMN IF NOT EXISTS label_zpl TEXT
     `);
-    console.log('✅ Database table "orders" ready');
+    logger.info('Database table "orders" ready', {
+      operation: 'db.migrate.orders'
+    });
     
     // Create product_shipping_defaults table for Smart Weight feature
     await client.query(`
@@ -65,19 +73,27 @@ export async function initDb() {
         dimension_unit VARCHAR
       )
     `);
-    console.log('✅ Database table "product_shipping_defaults" ready');
+    logger.info('Database table "product_shipping_defaults" ready', {
+      operation: 'db.migrate.product_shipping_defaults'
+    });
   } catch (err) {
     if (err.code === 'ECONNREFUSED') {
-      console.error('\n❌ ERROR: Cannot connect to PostgreSQL database.');
-      console.error('The database server is not running or not accessible.');
-      console.error('\nTroubleshooting steps:');
-      console.error('1. Make sure PostgreSQL is installed and running');
-      console.error('2. Check your DATABASE_URL connection string in backend/.env');
-      console.error('3. Verify PostgreSQL is listening on the correct host/port');
-      console.error('4. If using WSL, ensure PostgreSQL is running in WSL, not Windows');
-      console.error(`\nCurrent DATABASE_URL: ${DATABASE_URL.replace(/:[^:@]+@/, ':****@')}\n`);
+      logger.error('Cannot connect to PostgreSQL database', {
+        operation: 'db.connect',
+        error: err,
+        hints: [
+          'Make sure PostgreSQL is installed and running',
+          'Check DATABASE_URL in backend/.env',
+          'Verify PostgreSQL is listening on the correct host/port',
+          'If using WSL, ensure PostgreSQL is running in WSL, not Windows'
+        ],
+        databaseUrl: maskDatabaseUrl(DATABASE_URL)
+      });
     } else {
-      console.error('Database initialization error:', err.message);
+      logger.error('Database initialization error', {
+        operation: 'db.init',
+        error: err
+      });
     }
     throw err;
   } finally {

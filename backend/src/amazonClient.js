@@ -2,6 +2,7 @@ import zlib from 'zlib';
 import SellingPartnerAPI from 'amazon-sp-api';
 import { AMAZON_CONFIG, SHIP_FROM_ADDRESS, USE_MOCK } from './config.js';
 import { mockFetchUnshippedPrimeOrdersWithItems, mockBuyLabel } from './mock_api.js';
+import { logger } from './logger.js';
 
 const RETRYABLE_ERROR_CODES = new Set([
   'QuotaExceeded',
@@ -72,10 +73,14 @@ async function retryWithBackoff(fn, { context, maxRetries = 3, baseDelayMs = 100
       const delayMs = baseDelayMs * Math.pow(2, attempt);
       const contextLabel = context ? ` for ${context}` : '';
 
-      console.warn(
-        `Retrying Amazon SP-API call${contextLabel} (retry ${retryNumber}/${maxRetries})`,
+      logger.warn('Retrying Amazon SP-API call', {
+        operation: 'amazon.retry',
+        context,
+        retryNumber,
+        maxRetries,
+        delayMs,
         error
-      );
+      });
 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       attempt += 1;
